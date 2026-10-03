@@ -39,6 +39,14 @@ struct scrcpy_src {
 	int max_size;
 	int bitrate_kbps;
 	char *codec;
+	char *camera_size;
+	int camera_fps;
+	double camera_zoom;
+	bool camera_torch;
+	bool exposure_auto;
+	int iso;
+	int shutter_den;
+	char *orientation;
 };
 
 static const char *src_get_name(void *unused)
@@ -91,6 +99,14 @@ static bool pick_ephemeral_port(uint16_t *out)
 	return true;
 }
 
+static void write_camera_conf(const struct scrcpy_src *ctx)
+{
+	if (!ctx->video_source || strcmp(ctx->video_source, "camera") != 0)
+		return;
+	int den = ctx->shutter_den > 0 ? ctx->shutter_den : 60;
+	adb_write_camera_conf(ctx->serial, ctx->exposure_auto, ctx->iso, 1000000 / den);
+}
+
 static void start_scrcpy(struct scrcpy_src *ctx, obs_data_t *settings)
 {
 	uint16_t port = 0;
@@ -128,6 +144,21 @@ static void start_scrcpy(struct scrcpy_src *ctx, obs_data_t *settings)
 	if (ctx->video_source && strcmp(ctx->video_source, "camera") == 0)
 		snprintf(camera_arg, sizeof(camera_arg), "--camera-id=%d", ctx->camera_id);
 
+	char camera_size_arg[64] = {0};
+	char orientation_arg[64] = {0};
+	bool is_camera = ctx->video_source && strcmp(ctx->video_source, "camera") == 0;
+	if (is_camera && ctx->camera_size && *ctx->camera_size)
+		snprintf(camera_size_arg, sizeof(camera_size_arg), "--camera-size=%s", ctx->camera_size);
+	if (ctx->orientation && *ctx->orientation)
+		snprintf(orientation_arg, sizeof(orientation_arg), "--capture-orientation=%s", ctx->orientation);
+
+	char camera_fps_arg[32] = {0};
+	char camera_zoom_arg[48] = {0};
+	if (is_camera && ctx->camera_fps > 0)
+		snprintf(camera_fps_arg, sizeof(camera_fps_arg), "--camera-fps=%d", ctx->camera_fps);
+	if (is_camera && ctx->camera_zoom > 0.0)
+		snprintf(camera_zoom_arg, sizeof(camera_zoom_arg), "--camera-zoom=%.2f", ctx->camera_zoom);
+
 	char serial_arg[128] = {0};
 	if (ctx->serial && *ctx->serial)
 		snprintf(serial_arg, sizeof(serial_arg), "--serial=%s", ctx->serial);
@@ -151,6 +182,16 @@ static void start_scrcpy(struct scrcpy_src *ctx, obs_data_t *settings)
 		argv[n++] = source_arg;
 	if (camera_arg[0])
 		argv[n++] = camera_arg;
+	if (camera_size_arg[0])
+		argv[n++] = camera_size_arg;
+	if (orientation_arg[0])
+		argv[n++] = orientation_arg;
+	if (camera_fps_arg[0])
+		argv[n++] = camera_fps_arg;
+	if (camera_zoom_arg[0])
+		argv[n++] = camera_zoom_arg;
+	if (is_camera && ctx->camera_torch)
+		argv[n++] = "--camera-torch";
 	if (serial_arg[0])
 		argv[n++] = serial_arg;
 	argv[n] = NULL;
@@ -166,6 +207,8 @@ static void start_scrcpy(struct scrcpy_src *ctx, obs_data_t *settings)
 		dstr_printf(&lp, "%s/scrcpy-obs-child.log", tmp);
 		log_path = lp.array;
 	}
+
+	write_camera_conf(ctx);
 
 	obs_log(LOG_INFO, "scrcpy-source: spawning %s (port=%u, log=%s)", exe_path, (unsigned)port,
 		log_path ? log_path : "(none)");
@@ -202,10 +245,20 @@ static void load_settings(struct scrcpy_src *ctx, obs_data_t *settings)
 	bfree(ctx->serial);
 	bfree(ctx->video_source);
 	bfree(ctx->codec);
+	bfree(ctx->camera_size);
+	bfree(ctx->orientation);
 	ctx->serial = bstrdup(obs_data_get_string(settings, "serial"));
 	ctx->video_source = bstrdup(obs_data_get_string(settings, "video_source"));
 	ctx->codec = bstrdup(obs_data_get_string(settings, "codec"));
+	ctx->camera_size = bstrdup(obs_data_get_string(settings, "camera_size"));
+	ctx->orientation = bstrdup(obs_data_get_string(settings, "orientation"));
 	ctx->camera_id = (int)obs_data_get_int(settings, "camera_id");
+	ctx->camera_fps = (int)obs_data_get_int(settings, "camera_fps");
+	ctx->camera_zoom = obs_data_get_double(settings, "camera_zoom");
+	ctx->camera_torch = obs_data_get_bool(settings, "camera_torch");
+	ctx->exposure_auto = obs_data_get_bool(settings, "exposure_auto");
+	ctx->iso = (int)obs_data_get_int(settings, "iso");
+	ctx->shutter_den = atoi(obs_data_get_string(settings, "shutter_den"));
 	ctx->max_size = (int)obs_data_get_int(settings, "max_size");
 	ctx->bitrate_kbps = (int)obs_data_get_int(settings, "bitrate_kbps");
 }
@@ -240,14 +293,38 @@ static void src_destroy(void *data)
 	bfree(ctx->serial);
 	bfree(ctx->video_source);
 	bfree(ctx->codec);
+	bfree(ctx->camera_size);
+	bfree(ctx->orientation);
 	bfree(ctx);
+}
+
+static char *restart_key(const struct scrcpy_src *ctx)
+{
+	struct dstr k = {0};
+	dstr_printf(&k, "%s|%s|%d|%d|%d|%d|%d|%f|%d|%s|%s|%s", ctx->serial ? ctx->serial : "",
+		    ctx->video_source ? ctx->video_source : "", ctx->camera_id, ctx->max_size, ctx->bitrate_kbps,
+		    ctx->camera_fps, 0, ctx->camera_zoom, (int)ctx->camera_torch, ctx->codec ? ctx->codec : "",
+		    ctx->camera_size ? ctx->camera_size : "", ctx->orientation ? ctx->orientation : "");
+	return k.array;
 }
 
 static void src_update(void *data, obs_data_t *settings)
 {
 	struct scrcpy_src *ctx = data;
-	stop_scrcpy(ctx);
+	char *old_key = restart_key(ctx);
 	load_settings(ctx, settings);
+	char *new_key = restart_key(ctx);
+	bool running = ctx->proc_alive;
+	bool same = strcmp(old_key, new_key) == 0;
+	bfree(old_key);
+	bfree(new_key);
+
+	if (running && same) {
+		/* Only exposure settings changed: the server picks them up live. */
+		write_camera_conf(ctx);
+		return;
+	}
+	stop_scrcpy(ctx);
 	start_scrcpy(ctx, settings);
 }
 
@@ -258,6 +335,14 @@ static void src_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "max_size", 0);
 	obs_data_set_default_int(settings, "bitrate_kbps", 8000);
 	obs_data_set_default_string(settings, "codec", "h264");
+	obs_data_set_default_string(settings, "camera_size", "1920x1080");
+	obs_data_set_default_int(settings, "camera_fps", 30);
+	obs_data_set_default_double(settings, "camera_zoom", 0.0);
+	obs_data_set_default_bool(settings, "camera_torch", false);
+	obs_data_set_default_bool(settings, "exposure_auto", true);
+	obs_data_set_default_int(settings, "iso", 400);
+	obs_data_set_default_string(settings, "shutter_den", "60");
+	obs_data_set_default_string(settings, "orientation", "");
 }
 
 static bool refresh_devices_clicked(obs_properties_t *props, obs_property_t *p, void *data)
@@ -279,6 +364,22 @@ static bool video_source_modified(obs_properties_t *props, obs_property_t *p, ob
 	obs_property_t *camera_id = obs_properties_get(props, "camera_id");
 	if (camera_id)
 		obs_property_set_visible(camera_id, is_camera);
+	const char *cam_props[] = {"camera_fps", "camera_zoom", "camera_torch", "exposure_auto"};
+	for (size_t i = 0; i < sizeof(cam_props) / sizeof(cam_props[0]); i++) {
+		obs_property_t *cp = obs_properties_get(props, cam_props[i]);
+		if (cp)
+			obs_property_set_visible(cp, is_camera);
+	}
+	obs_property_t *camera_size = obs_properties_get(props, "camera_size");
+	if (camera_size)
+		obs_property_set_visible(camera_size, is_camera);
+	bool manual = is_camera && !obs_data_get_bool(settings, "exposure_auto");
+	obs_property_t *iso = obs_properties_get(props, "iso");
+	if (iso)
+		obs_property_set_visible(iso, manual);
+	obs_property_t *shutter = obs_properties_get(props, "shutter_den");
+	if (shutter)
+		obs_property_set_visible(shutter, manual);
 	return true;
 }
 
@@ -291,7 +392,8 @@ static obs_properties_t *src_get_properties(void *data)
 							   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	fill_device_list(dev_list);
 
-	obs_properties_add_button(props, "refresh_devices", obs_module_text("RefreshDevices"), refresh_devices_clicked);
+	obs_properties_add_button2(props, "refresh_devices", obs_module_text("RefreshDevices"), refresh_devices_clicked,
+				 NULL);
 
 	obs_property_t *src_list = obs_properties_add_list(props, "video_source", obs_module_text("VideoSource"),
 							   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -301,6 +403,42 @@ static obs_properties_t *src_get_properties(void *data)
 
 	obs_property_t *camera_id = obs_properties_add_int(props, "camera_id", obs_module_text("CameraId"), 0, 9, 1);
 	obs_property_set_visible(camera_id, ctx->video_source && strcmp(ctx->video_source, "camera") == 0);
+
+	obs_property_t *cam_size = obs_properties_add_text(props, "camera_size", obs_module_text("CameraSize"), OBS_TEXT_DEFAULT);
+	obs_property_set_visible(cam_size, ctx->video_source && strcmp(ctx->video_source, "camera") == 0);
+
+	obs_property_t *cam_fps = obs_properties_add_int(props, "camera_fps", obs_module_text("CameraFps"), 0, 120, 1);
+	obs_property_t *cam_zoom = obs_properties_add_float_slider(props, "camera_zoom", obs_module_text("CameraZoom"), 0.0, 10.0, 0.1);
+	obs_property_t *cam_torch = obs_properties_add_bool(props, "camera_torch", obs_module_text("CameraTorch"));
+	bool cam_visible = ctx->video_source && strcmp(ctx->video_source, "camera") == 0;
+	obs_property_set_visible(cam_fps, cam_visible);
+	obs_property_set_visible(cam_zoom, cam_visible);
+	obs_property_set_visible(cam_torch, cam_visible);
+
+	obs_property_t *exp_auto = obs_properties_add_bool(props, "exposure_auto", obs_module_text("ExposureAuto"));
+	obs_property_set_modified_callback(exp_auto, video_source_modified);
+	obs_property_t *iso = obs_properties_add_int_slider(props, "iso", obs_module_text("Iso"), 50, 6400, 50);
+	obs_property_t *shutter = obs_properties_add_list(props, "shutter_den", obs_module_text("Shutter"),
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	static const char *const dens[] = {"30", "50", "60", "100", "120", "250", "500", "1000", "2000", "4000"};
+	for (size_t i = 0; i < sizeof(dens) / sizeof(dens[0]); i++) {
+		struct dstr label = {0};
+		dstr_printf(&label, "1/%s", dens[i]);
+		obs_property_list_add_string(shutter, label.array, dens[i]);
+		dstr_free(&label);
+	}
+	obs_property_set_visible(exp_auto, cam_visible);
+	bool manual_visible = cam_visible && !ctx->exposure_auto;
+	obs_property_set_visible(iso, manual_visible);
+	obs_property_set_visible(shutter, manual_visible);
+
+	obs_property_t *orient = obs_properties_add_list(props, "orientation", obs_module_text("Orientation"),
+							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(orient, obs_module_text("OrientationAuto"), "");
+	obs_property_list_add_string(orient, "0", "0");
+	obs_property_list_add_string(orient, "90", "90");
+	obs_property_list_add_string(orient, "180", "180");
+	obs_property_list_add_string(orient, "270", "270");
 
 	obs_properties_add_int(props, "max_size", obs_module_text("MaxSize"), 0, 4096, 16);
 

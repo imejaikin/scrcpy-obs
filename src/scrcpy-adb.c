@@ -253,3 +253,44 @@ char *first_adb_serial(void)
 	bfree(output);
 	return result;
 }
+
+#define CAMERA_CONF_PATH "/data/local/tmp/scrcpy-obs-camera.conf"
+
+void adb_write_camera_conf(const char *serial, bool auto_exposure, int iso, int exposure_us)
+{
+	if (!serial || !*serial)
+		return;
+	/* the serial ends up in a command line: accept only plain characters */
+	for (const char *c = serial; *c; c++) {
+		if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || *c == '.' ||
+		      *c == ':' || *c == '-' || *c == '_'))
+			return;
+	}
+
+	char *adb = get_adb_exe();
+	struct dstr cmd = {0};
+	dstr_catf(&cmd, "\"%s\" -s %s shell \"printf 'ae=%d\niso=%d\nexposure_us=%d\n' > %s.tmp && mv %s.tmp %s\"", adb,
+		  serial, auto_exposure ? 1 : 0, iso, exposure_us, CAMERA_CONF_PATH, CAMERA_CONF_PATH, CAMERA_CONF_PATH);
+	bfree(adb);
+
+#ifdef _WIN32
+	int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.array, -1, NULL, 0);
+	wchar_t *wcmd = bmalloc((size_t)wlen * sizeof(wchar_t));
+	MultiByteToWideChar(CP_UTF8, 0, cmd.array, -1, wcmd, wlen);
+
+	STARTUPINFOW si = {0};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {0};
+	if (CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+		WaitForSingleObject(pi.hProcess, 3000);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	}
+	bfree(wcmd);
+#else
+	dstr_cat(&cmd, " >/dev/null 2>&1");
+	int rc = system(cmd.array);
+	UNUSED_PARAMETER(rc);
+#endif
+	dstr_free(&cmd);
+}
